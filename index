@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="format-detection" content="telephone=no">
+  <title>法務智研｜法律/判決搜尋（MVP）</title>
+  <link rel="shortcut icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html, body { height: 100%; background: #0B1220; color: #E5E7EB; -webkit-font-smoothing: antialiased; }
+    .card { background: rgba(255,255,255,0.06); backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,0.08); }
+    .input { background:#101827; border:1px solid #243244; }
+    .input:focus { outline: none; border-color:#4F8BF5; box-shadow: 0 0 0 3px rgba(79,139,245,.25); }
+    .tag { background: #1E293B; border: 1px solid #334155; }
+    .hl { background: #f59e0b33; border-radius: 4px; padding: 0 2px; }
+    /* 避免 iOS 小字自動放大：輸入字型>=16px */
+    input, button { font-size: 16px; }
+  </style>
+</head>
+<body class="min-h-screen">
+  <div class="max-w-3xl mx-auto px-4 py-6">
+    <header class="mb-4">
+      <h1 class="text-2xl font-semibold tracking-wide">法務智研｜法律/判決搜尋（MVP）</h1>
+      <p class="text-sm text-gray-400 mt-1">支援 LQL：<span class="font-mono">A&amp;B</span>（且）、<span class="font-mono">A+B</span>（或）、<span class="font-mono">A-B</span>（不含）、<span class="font-mono">(A+B)&amp;C</span>、左至右解析。</p>
+    </header>
+
+    <section class="card rounded-2xl p-3 md:p-4">
+      <div class="flex gap-2 items-center">
+        <input id="q" class="flex-1 input rounded-xl px-3 py-3 font-medium placeholder:text-gray-500"
+               placeholder="輸入：民法第一條、(共有+繼承)&分割、或貼上關鍵句（例：法律所未規定者 依習慣）" />
+        <button id="btnSearch" class="rounded-xl bg-blue-500 hover:bg-blue-600 px-4 py-3 font-semibold">搜尋</button>
+      </div>
+      <div class="flex flex-wrap gap-2 mt-3 text-xs">
+        <span class="tag px-2 py-1 rounded-lg cursor-pointer quick">民法第一條</span>
+        <span class="tag px-2 py-1 rounded-lg cursor-pointer quick">(共有+繼承)&分割</span>
+        <span class="tag px-2 py-1 rounded-lg cursor-pointer quick">僱傭+雇用-承攬</span>
+        <span class="tag px-2 py-1 rounded-lg cursor-pointer quick">精神損害+慰撫金</span>
+      </div>
+      <div class="text-[13px] text-gray-400 mt-2">
+        說明：輸入任一關鍵字、條號（例：<span class="font-mono">民法36</span>）、或 LQL。系統會先解析語法，再送到資料端（GAS）檢索，前端高亮匹配詞。
+      </div>
+    </section>
+
+    <section id="status" class="mt-4 text-sm text-gray-400"></section>
+
+    <section id="results" class="mt-3 grid gap-3"></section>
+
+    <footer class="text-[12px] text-gray-500 mt-10">
+      <div>© 育昇法務・法務智研 v3.0（MVP）</div>
+    </footer>
+  </div>
+
+<script>
+/** ============== 環境設定 ============== **/
+const GAS_ENDPOINT = "https://script.google.com/macros/s/AKfycby08CdDC6bc6aOkHyXTyBKjimjL9eeTry6n-4hXAIqh5JE7bz3Uq-v4h5FSDDmKF_Qm4A/exec";
+
+/** ============== LQL 解析器（左至右、支援 ()、&、+、-） ============== **/
+/* 產生一組查詢條件：{ must:[], any:[], not:[] } */
+function parseLQL(raw){
+  const s = String(raw||"").trim();
+  if(!s) return {must:[],any:[],not:[],raw:""};
+
+  // tokenize: () & + - 與詞（含全半形數字、中文）
+  const tokens = [];
+  let buf="";
+  const pushBuf=()=>{ if(buf.trim()) tokens.push({t:"term",v:buf.trim()}); buf=""; };
+
+  for(let i=0;i<s.length;i++){
+    const c=s[i];
+    if("()&+-".includes(c)){
+      pushBuf(); tokens.push({t:c,v:c});
+    }else{
+      buf+=c;
+    }
+  }
+  pushBuf();
+
+  // 轉為 RPN（Shunting-yard），優先級：() > & > + > -
+  const prec = { "&":3, "+":2, "-":1 };
+  const output=[], stack=[];
+  for(const tk of tokens){
+    if(tk.t==="term"){ output.push(tk); }
+    else if(tk.t==="("){ stack.push(tk); }
+    else if(tk.t===")"){
+      while(stack.length && stack[stack.length-1].t!=="(") output.push(stack.pop());
+      if(stack.length && stack[stack.length-1].t==="(") stack.pop();
+    }else{ // operator
+      while(stack.length && stack[stack.length-1].t!=="(" &&
+            prec[stack[stack.length-1].t] >= prec[tk.t]){
+        output.push(stack.pop());
+      }
+      stack.push(tk);
+    }
+  }
+  while(stack.length) output.push(stack.pop());
+
+  // 以 RPN 建 AST（每個 operator 2 元）
+  const st=[];
+  for(const tk of output){
+    if(tk.t==="term"){ st.push({type:"term",val:tk.v}); }
+    else{
+      const b=st.pop(), a=st.pop();
+      st.push({type:"op",op:tk.t,left:a,right:b});
+    }
+  }
+  const ast = st[0] || null;
+
+  // 把 AST 攤平成 must/any/not 集合
+  const cond = { must:[], any:[], not:[], raw:s };
+  const walk=(node, context="any")=>{
+    if(!node) return;
+    if(node.type==="term"){
+      const v = node.val.replace(/\s+/g," ").trim();
+      if(!v) return;
+      if(context==="must") cond.must.push(v);
+      else if(context==="not") cond.not.push(v);
+      else cond.any.push(v);
+      return;
+    }
+    if(node.type==="op"){
+      if(node.op==="&"){ walk(node.left,"must"); walk(node.right,"must"); }
+      else if(node.op==="+"){ walk(node.left,"any"); walk(node.right,"any"); }
+      else if(node.op==="-"){ walk(node.left,"must"); walk(node.right,"not"); }
+    }
+  };
+  walk(ast);
+  // 去重
+  cond.must = Array.from(new Set(cond.must.filter(Boolean)));
+  cond.any  = Array.from(new Set(cond.any.filter(Boolean)));
+  cond.not  = Array.from(new Set(cond.not.filter(Boolean)));
+  return cond;
+}
+
+/** ============== 呼叫 GAS + 結果渲染 ============== **/
+const $ = (q)=>document.querySelector(q);
+const $$ = (q)=>Array.from(document.querySelectorAll(q));
+
+function setStatus(msg){ $("#status").textContent = msg || ""; }
+
+function escapeHTML(s){
+  return String(s||"").replace(/[&<>"'`]/g, c=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;" }[c]));
+}
+
+function highlight(text, terms){
+  let t = escapeHTML(text);
+  for(const w of terms){
+    if(!w) continue;
+    const re = new RegExp("("+w.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+")","gi");
+    t = t.replace(re, "<span class='hl'>$1</span>");
+  }
+  return t;
+}
+
+async function search(){
+  const q = $("#q").value.trim();
+  if(!q){ setStatus("請輸入查詢詞或 LQL 語法"); $("#results").innerHTML=""; return; }
+
+  const lql = parseLQL(q);
+  setStatus("解析中…  必須含有: ["+lql.must.join("，")+"]  可能含有: ["+lql.any.join("，")+"]  不含: ["+lql.not.join("，")+"]");
+
+  // 先把原字串丟給 GAS，後端做第一輪過濾；回前 5~10 筆即可
+  const url = new URL(GAS_ENDPOINT);
+  url.searchParams.set("q", q);
+  url.searchParams.set("limit","10"); // 你 GAS 若有支援就會生效
+  try{
+    const res = await fetch(url.toString(), { method:"GET" });
+    const txt = await res.text();
+    let data;
+    try{ data = JSON.parse(txt); }
+    catch{ data = { ok:true, results: Array.isArray(txt)?txt:[], raw:txt }; }
+
+    // 後端若回包裝：{ok, results:[{title,content,keywords,extra,rowIndex}]}
+    const rows = (data && Array.isArray(data.results)) ? data.results :
+                 (Array.isArray(data) ? data : []);
+
+    // 前端再做 LQL 二次過濾（保險起見）
+    const matched = rows.filter(r=>{
+      const blob = [r.title, r.content, r.keywords, r.extra].join(" ").toLowerCase();
+      const inAllMust = (lql.must.length===0) || lql.must.every(t=>blob.includes(String(t).toLowerCase()));
+      const inAny = (lql.any.length===0) || lql.any.some(t=>blob.includes(String(t).toLowerCase()));
+      const noneNot = (lql.not.length===0) || lql.not.every(t=>!blob.includes(String(t).toLowerCase()));
+      // 左至右策略已在 AST 轉 must/any/not；此處簡化再次驗證
+      return inAllMust && noneNot && (lql.any.length? inAny : true);
+    });
+
+    render(matched, lql);
+    setStatus(`找到 ${matched.length} 筆（顯示最多 10 筆）。`);
+  }catch(e){
+    console.error(e);
+    setStatus("查詢失敗：無法連線或回應格式不正確。");
+  }
+}
+
+function render(rows, lql){
+  const box = $("#results");
+  if(!rows.length){ box.innerHTML = `<div class="text-sm text-gray-400">－ 沒有符合的結果 －</div>`; return; }
+  box.innerHTML = rows.map((r,i)=>{
+    const title = highlight(r.title || "（無標題）", [...lql.must,...lql.any]);
+    const snippet = highlight((r.content || r.keywords || "").slice(0,240), [...lql.must,...lql.any]);
+    const kw = (r.keywords || "").split(/[、，,;；\s]+/).filter(Boolean).slice(0,6);
+    return `
+      <article class="card rounded-2xl p-4">
+        <div class="flex items-start justify-between gap-3">
+          <h3 class="text-lg font-semibold leading-6">${title}</h3>
+          <div class="text-xs text-gray-400">#${r.rowIndex || (i+1)}</div>
+        </div>
+        <p class="mt-2 text-[14px] leading-6 text-gray-300">${snippet}</p>
+        <div class="flex flex-wrap gap-2 mt-3">
+          ${kw.map(t=>`<span class="tag text-[12px] px-2 py-1 rounded-lg">${escapeHTML(t)}</span>`).join("")}
+        </div>
+      </article>
+    `;
+  }).join("");
+}
+
+/** ============== 事件 ============== **/
+$("#btnSearch").addEventListener("click", search);
+$("#q").addEventListener("keydown", e=>{ if(e.key==="Enter") search(); });
+$$(".quick").forEach(el=>el.addEventListener("click", ()=>{
+  $("#q").value = el.textContent.trim();
+  search();
+}));
+
+// 首次自動聚焦（避免 iOS 自動放大，用 >=16px 字體已處理）
+setTimeout(()=>{ $("#q").focus(); }, 200);
+</script>
+</body>
+</html>
